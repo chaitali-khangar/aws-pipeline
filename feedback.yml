@@ -1,0 +1,396 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation Template for Feedback File Processing Architecture
+  using S3, EventBridge, Lambda, SQS Dead Letter Queue, and external
+  Microservice integration via Cloud Storage Connect (TCP 443).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: [poc, dev, staging, prod]
+    Description: Deployment environment
+
+  MicroserviceEndpoint:
+    Type: String
+    Description: URL of the external microservice endpoint
+
+  SupportEmailAddress:
+    Type: String
+    Description: Email address for support group notifications
+
+  GlobalScapeVaultSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret for Global Scape Vault credentials
+
+  TCSOAEndpoint:
+    Type: String
+    Description: TC SOA (external system) endpoint URL
+
+Resources:
+
+  # -------------------------------------------------------
+  # S3 Bucket - Central file storage with prefixes
+  # -------------------------------------------------------
+  FeedbackFilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-feedback-files-bucket"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldFiles
+            Status: Enabled
+            Prefix: poc/feedback/files/archive/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: FeedbackFileProcessing
+
+  # -------------------------------------------------------
+  # SQS Dead Letter Queue
+  # -------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-feedback-dead-letter-queue"
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+
+  # -------------------------------------------------------
+  # IAM Role for Lambda Functions
+  # -------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-feedback-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FeedbackLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FeedbackFilesBucket.Arn
+                  - !Sub "${FeedbackFilesBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GlobalScapeVaultSecretArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # -------------------------------------------------------
+  # Lambda 1 - Microservice Invocation (inbox trigger)
+  # -------------------------------------------------------
+  InvokeMicroserviceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-invoke-microservice"
+      Runtime: java11
+      Handler: com.ge.feedback.InvokeMicroserviceHandler::handleRequest
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          MICROSERVICE_ENDPOINT: !Ref MicroserviceEndpoint
+          BUCKET_NAME: !Ref FeedbackFilesBucket
+          INBOX_PREFIX: poc/feedback/files/inbox
+          ARCHIVE_PREFIX: !Sub "poc/feedback/files/archive/${!aws:CurrentDate}"
+          FAILED_PREFIX: poc/feedback/files/failed-files
+          DLQ_URL: !Ref DeadLetterQueue
+          ENVIRONMENT: !Ref Environment
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------
+  # Lambda 2 - Email Support Group (failed-files trigger)
+  # -------------------------------------------------------
+  EmailSupportGroupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-email-support-group"
+      Runtime: java11
+      Handler: com.ge.feedback.EmailSupportGroupHandler::handleRequest
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SUPPORT_EMAIL: !Ref SupportEmailAddress
+          BUCKET_NAME: !Ref FeedbackFilesBucket
+          FAILED_PREFIX: poc/feedback/files/failed-files
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------
+  # Lambda 3 - DLQ Email Support (SQS Dead Letter trigger)
+  # -------------------------------------------------------
+  DLQEmailSupportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-dlq-email-support"
+      Runtime: java11
+      Handler: com.ge.feedback.DLQEmailSupportHandler::handleRequest
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SUPPORT_EMAIL: !Ref SupportEmailAddress
+          ENVIRONMENT: !Ref Environment
+      Events:
+        DLQTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DeadLetterQueue.Arn
+            BatchSize: 1
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DLQTriggerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DeadLetterQueue.Arn
+      FunctionName: !GetAtt DLQEmailSupportLambda.Arn
+      BatchSize: 1
+      Enabled: true
+
+  # -------------------------------------------------------
+  # EventBridge Rule 1 - Inbox Object Created -> Invoke Microservice
+  # -------------------------------------------------------
+  EventBridgeRule1:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-rule1-inbox-invoke-microservice"
+      Description: "Event: Object Created, Filter: poc/feedback/files/inbox, Invoke Microservice"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref FeedbackFilesBucket
+          object:
+            key:
+              - prefix: poc/feedback/files/inbox
+      State: ENABLED
+      Targets:
+        - Id: InvokeMicroserviceTarget
+          Arn: !GetAtt InvokeMicroserviceLambda.Arn
+
+  EventBridgeRule1LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InvokeMicroserviceLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule1.Arn
+
+  # -------------------------------------------------------
+  # EventBridge Rule 2 - Failed Files Object Created -> Email Support
+  # -------------------------------------------------------
+  EventBridgeRule2:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-rule2-failed-files-email-support"
+      Description: "Event: Object Created, Filter: poc/feedback/files/failed-files/inbox, Email Support Group"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref FeedbackFilesBucket
+          object:
+            key:
+              - prefix: poc/feedback/files/failed-files
+      State: ENABLED
+      Targets:
+        - Id: EmailSupportGroupTarget
+          Arn: !GetAtt EmailSupportGroupLambda.Arn
+
+  EventBridgeRule2LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EmailSupportGroupLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule2.Arn
+
+  # -------------------------------------------------------
+  # EventBridge Rule 3 - SQS Dead Letter Object Created -> Email Support
+  # -------------------------------------------------------
+  EventBridgeRule3:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-rule3-dlq-email-support"
+      Description: "Event: Object Created -> SQS Dead Letter Queue -> Trigger Lambda Email Support"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref FeedbackFilesBucket
+      State: ENABLED
+      Targets:
+        - Id: DeadLetterQueueTarget
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  EventBridgeRule3SQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt EventBridgeRule3.Arn
+
+  # -------------------------------------------------------
+  # SES Email Identity (for support group emails)
+  # -------------------------------------------------------
+  SESEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SupportEmailAddress
+
+  # -------------------------------------------------------
+  # CloudWatch Log Groups for Lambda Functions
+  # -------------------------------------------------------
+  InvokeMicroserviceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Environment}-invoke-microservice"
+      RetentionInDays: 30
+
+  EmailSupportGroupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Environment}-email-support-group"
+      RetentionInDays: 30
+
+  DLQEmailSupportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Environment}-dlq-email-support"
+      RetentionInDays: 30
+
+# -------------------------------------------------------
+# Outputs
+# -------------------------------------------------------
+Outputs:
+  FeedbackBucketName:
+    Description: Name of the S3 bucket for feedback files
+    Value: !Ref FeedbackFilesBucket
+    Export:
+      Name: !Sub "${Environment}-FeedbackBucketName"
+
+  DeadLetterQueueUrl:
+    Description: URL of the SQS Dead Letter Queue
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub "${Environment}-DeadLetterQueueUrl"
+
+  DeadLetterQueueArn:
+    Description: ARN of the SQS Dead Letter Queue
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${Environment}-DeadLetterQueueArn"
+
+  InvokeMicroserviceLambdaArn:
+    Description: ARN of the Invoke Microservice Lambda
+    Value: !GetAtt InvokeMicroserviceLambda.Arn
+
+  EmailSupportGroupLambdaArn:
+    Description: ARN of the Email Support Group Lambda
+    Value: !GetAtt EmailSupportGroupLambda.Arn
+
+  DLQEmailSupportLambdaArn:
+    Description: ARN of the DLQ Email Support Lambda
+    Value: !GetAtt DLQEmailSupportLambda.Arn
+
+  BucketPrefixes:
+    Description: S3 bucket prefix structure
+    Value: !Sub |
+      Inbox:    poc/feedback/files/inbox
+      Archive:  poc/feedback/files/archive/YYYY_mm
+      Failed:   poc/feedback/files/failed-files
